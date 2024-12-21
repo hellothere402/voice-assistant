@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.class
+
+# Project specific
+models_cache/
+*.log
+*.bin
+config.yaml
+voice_profiles.json
+response_cache.json
+*.wav
+*.mp3
+temp_audio_*
+
+# Environment
+.env
+venv/
+env/
+
+# System
+.DS_Store
