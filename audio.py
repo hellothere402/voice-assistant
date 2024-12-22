@@ -36,87 +36,93 @@ class AudioInputSystem:
         self.is_running = False
         self.stream: Optional[pyaudio.Stream] = None
 
-    def start_audio_stream(self):
-        """Start the audio input stream"""
-        if self.is_running:
-            return
+        self.is_paused = False
 
-        self.is_running = True
+    def start_audio_stream(self):
+      """Start the audio input stream"""
+      if self.is_running:
+         return
+
+      self.is_running = True
+      self.audio_buffer.clear()  # Clear any old data
+    
+      # Open audio stream
+      self.stream = self.audio.open(
+        format=self.FORMAT,
+        channels=self.CHANNELS,
+        rate=self.RATE,
+        input=True,
+        frames_per_buffer=self.CHUNK,
+        stream_callback=self._audio_callback
+      )
+    
+      print("Audio input system started")
+    
+    def pause(self):
+        """Pause audio input processing"""
+        self.is_paused = True
+        self.audio_buffer.clear()  # Clear any buffered audio
         
-        # Open audio stream
-        self.stream = self.audio.open(
-            format=self.FORMAT,
-            channels=self.CHANNELS,
-            rate=self.RATE,
-            input=True,
-            frames_per_buffer=self.CHUNK,
-            stream_callback=self._audio_callback
-        )
-        
-        # Start processing thread
-        self.processing_thread = threading.Thread(target=self._process_audio)
-        self.processing_thread.daemon = True
-        self.processing_thread.start()
-        
-        print("Audio input system started")
+    def resume(self):
+        """Resume audio input processing"""
+        self.is_paused = False
 
     def _audio_callback(self, in_data, frame_count, time_info, status):
         """Callback for audio stream"""
         try:
+            # Don't process audio if paused
+            if self.is_paused:
+                return (in_data, pyaudio.paContinue)
+                
             # Convert audio data to numpy array
             audio_data = np.frombuffer(in_data, dtype=np.float32)
             
-            # Add to buffer
-            self.audio_buffer.extend(audio_data)
+            # Add to buffer only if not paused
+            if not self.is_paused:
+                self.audio_buffer.extend(audio_data)
             
             # Convert to format suitable for VAD (16-bit PCM)
             audio_for_vad = (audio_data * 32767).astype(np.int16).tobytes()
             
-            # Check for voice activity
-            if self.vad.is_speech(audio_for_vad, self.RATE):
+            # Check for voice activity only if not paused
+            if not self.is_paused and self.vad.is_speech(audio_for_vad, self.RATE):
                 self.voice_segments_queue.put(audio_data)
             
             return (in_data, pyaudio.paContinue)
-        
+            
         except Exception as e:
             print(f"Error in audio callback: {e}")
             return (None, pyaudio.paAbort)
         
     def _process_audio(self):
-        """Process detected voice segments"""
-        last_status_time = time.time()
-        while self.is_running:
-            try:
-                # Get voice segment from queue
-                audio_segment = self.voice_segments_queue.get(timeout=1.0)
-                print("🎤 Voice detected - Listening...")
-                
-                # Collect audio segments for a complete utterance
-                segments = [audio_segment]
-                silence_counter = 0
-                
-                # Keep collecting until silence is detected
-                while silence_counter < 10:
-                    try:
-                        segment = self.voice_segments_queue.get(timeout=0.1)
-                        segments.append(segment)
-                        silence_counter = 0
-                    except queue.Empty:
-                        silence_counter += 1
-                
-                # Combine all segments
-                complete_utterance = np.concatenate(segments)
-                self.audio_buffer.extend(complete_utterance)
-                print("✨ Processing your speech...")
-                
-            except queue.Empty:
-                # Show periodic status
-                current_time = time.time()
-                if current_time - last_status_time > 5:
-                    print("👂 Listening for voice...", end='\r')
-                    last_status_time = current_time
-            except Exception as e:
-                print(f"❌ Error processing audio: {e}")
+      """Process detected voice segments"""
+      while self.is_running:
+        try:
+            # Get voice segment from queue without timeout
+            audio_segment = self.voice_segments_queue.get()
+            print("🎤 Voice detected - Listening...")
+            
+            # Collect audio segments for a complete utterance
+            segments = [audio_segment]
+            silence_counter = 0
+            
+            # Keep collecting until definitive silence is detected
+            # No timeout, just wait for clear end of speech
+            while silence_counter < 15:  # Increased silence threshold
+                try:
+                    segment = self.voice_segments_queue.get(timeout=0.1)
+                    segments.append(segment)
+                    silence_counter = 0
+                except queue.Empty:
+                    silence_counter += 1
+            
+            # Combine all segments
+            complete_utterance = np.concatenate(segments)
+            self.audio_buffer.extend(complete_utterance)
+            print("✨ Processing your speech...")
+            
+        except Exception as e:
+            print(f"❌ Error processing audio: {e}")
    
     def get_audio_buffer(self):
         """Get the current contents of the audio buffer"""

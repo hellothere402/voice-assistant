@@ -31,6 +31,7 @@ class ResponseGenerator:
      self.cache_file = cache_file
      self.response_cache = self._load_cache()
      self.audio_queue = Queue()
+     self.is_speaking = False
 
      # Initialize processors
      self.local_processor = LocalProcessor()
@@ -163,38 +164,40 @@ class ResponseGenerator:
       self.playback_thread.daemon = True
       self.playback_thread.start()
 
+    class ResponseGenerator:
+     def __init__(self, openai_api_key: str, cache_file: str = "response_cache.json", voice_id: str = "nova"):
+        self.api_key = openai_api_key
+        self.cache_file = cache_file
+        self.response_cache = self._load_cache()
+        self.audio_queue = Queue()
+        self.is_speaking = False  # Add this flag
+        # ... rest of init ...
+
     def _play_audio(self, audio_data: bytes):
-      """Play audio data"""
-      temp_file = f"temp_audio_{int(time.time())}.mp3"  # Make filename unique
-      try:
-          with open(temp_file, "wb") as f:
-             f.write(audio_data)
+        """Play audio data"""
+        temp_file = f"temp_audio_{int(time.time())}.mp3"
+        try:
+            self.is_speaking = True  # Set flag when starting to speak
+            with open(temp_file, "wb") as f:
+                f.write(audio_data)
             
-          pygame.mixer.music.load(temp_file)
-          pygame.mixer.music.play()
-        
-          # Wait for audio to finish playing
-          while pygame.mixer.music.get_busy():
-            pygame.time.Clock().tick(10)
+            pygame.mixer.music.load(temp_file)
+            pygame.mixer.music.play()
             
-          # Add a small delay before cleanup
-          time.sleep(0.1)
+            # Wait for audio to finish
+            while pygame.mixer.music.get_busy():
+                pygame.time.Clock().tick(10)
             
-      finally:
-        # Try multiple times to remove the file
-        max_attempts = 3
-        for attempt in range(max_attempts):
+            pygame.mixer.music.unload()
+            self.audio_queue.task_done()
+            
+        finally:
+            self.is_speaking = False  # Clear flag when done speaking
             try:
                 if os.path.exists(temp_file):
-                    pygame.mixer.music.unload()  # Unload before deleting
                     os.remove(temp_file)
-                break
-            except PermissionError:
-                if attempt < max_attempts - 1:
-                    time.sleep(0.2)  # Wait a bit before retrying
-                else:
-                    print(f"⚠️ Could not remove temporary file: {temp_file}")
-
+            except Exception as e:
+                print(f"⚠️ Warning: Could not remove temporary file: {e}")
 
 class LocalProcessor:
     def __init__(self):

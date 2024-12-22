@@ -9,6 +9,7 @@ import time
 from response import Query
 import numpy as np
 import os
+import pygame
 
 from sym import SystemManager
 from voice import VoiceProcessingSystem
@@ -290,53 +291,78 @@ class IntegratedVoiceAssistant:
     async def _process_cycle(self):
      """Main processing cycle"""
      try:
-         # Get audio from buffer
-         audio_data = self.audio_system.get_audio_buffer()
-        
-         if len(audio_data) > 0:
-            min_samples = self.config.sample_rate * 2
+        # Only process new input if we're not already handling a query
+        if (hasattr(self, 'is_processing') and self.is_processing) or \
+           self.response_generator.is_speaking:  # Check if assistant is speaking
+            await asyncio.sleep(0.1)
+            return
 
-            if len(audio_data) < min_samples:
-                return
+        # Get audio from buffer
+        audio_data = self.audio_system.get_audio_buffer()
+        
+        if len(audio_data) > 0 and len(audio_data) >= self.config.sample_rate * 2:
+            # Set processing flag
+            self.is_processing = True
+            self.audio_system.pause()  # Pause audio input
             
-            print("\nProcessing audio input...")
-            
-                # Ensure proper shape
-            audio_data = audio_data[:min_samples]
-            audio_data = audio_data.reshape(1, -1)
-            
-            # Process voice
-            voice_result = self.voice_processor.process_voice(
-                audio_data,
-                self.config.sample_rate
-            )
-            
-            # If speaker recognized and speech detected
-            if voice_result and voice_result.text:
-                print(f"\n👤 You said: {voice_result.text}")
+            try:
+                print("\nProcessing audio input...")
                 
-                # Create query object
-                query_obj = Query(
-                    text=voice_result.text,
-                    intent=voice_result.intent,
-                    speaker_id=voice_result.speaker_id
+                # Process voice and generate response
+                audio_data = audio_data.reshape(1, -1)
+                voice_result = self.voice_processor.process_voice(
+                    audio_data,
+                    self.config.sample_rate
                 )
                 
-                # Generate response
-                print("💭 Generating response...")
-                response = await self.response_generator.generate_response(query_obj)
-                if response and response.text:
-                    print(f"🤖 Assistant: {response.text}\n")
-            
-            # Clear the buffer after processing
-            self.audio_system.audio_buffer.clear()
-            
-         await asyncio.sleep(0.1)  # Short sleep to prevent CPU overuse
+                if voice_result and voice_result.text:
+                    print(f"\n👤 You said: {voice_result.text}")
+                    
+                    query_obj = Query(
+                        text=voice_result.text,
+                        intent=voice_result.intent,
+                        speaker_id=voice_result.speaker_id
+                    )
+                    
+                    print("💭 Generating response...")
+                    response = await self.response_generator.generate_response(query_obj)
+                    
+                    if response and response.text:
+                        print(f"🤖 Assistant: {response.text}\n")
+                        
+                        # Wait for TTS audio to complete
+                        if response.audio:
+                            # Wait for the playback to fully complete
+                            while self.response_generator.is_speaking or \
+                                  self.response_generator.audio_queue.qsize() > 0:
+                                await asyncio.sleep(0.1)
+                            
+                            # Additional wait to ensure everything is done
+                            await asyncio.sleep(0.2)
+                            
+                            # Now clear the buffer and resume listening
+                            self.audio_system.audio_buffer.clear()
+                            print("\n👂 Listening for your voice...")
+                
+            finally:
+                self.is_processing = False
+                self.audio_system.resume()
+                
+        await asyncio.sleep(0.1)
 
      except Exception as e:
         print(f"❌ Error in processing cycle: {e}")
         print(f"Error details: {str(e)}")
         self.system_manager.performance_monitor.log_error()
+        self.is_processing = False
+        self.audio_system.resume()
+
+    async def _wait_for_audio_completion(self):
+      """Wait for TTS audio playback to complete"""
+      while self.response_generator.audio_queue.qsize() > 0:
+        await asyncio.sleep(0.1)
+      # Additional small delay after audio completes
+      await asyncio.sleep(0.2)
 
     def stop(self):
         """Stop the voice assistant"""
