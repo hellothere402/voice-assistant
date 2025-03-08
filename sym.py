@@ -286,25 +286,3 @@ class PerformanceMonitor:
         self.metrics_queue.put(duration)
 
 
-
-if __name__ == "__main__":
-    # Initialize system manager
-    system_manager = SystemManager()
-    
-    try:
-        # Add test voice profile
-        profile = VoiceProfileData(
-            user_id="test_user",
-            name="Test User",
-            embeddings=[np.random.rand(512)],
-            last_updated=datetime.now(),
-            active=True
-        )
-        
-        system_manager.voice_manager.add_profile(profile)
-        
-        # Run for a while to see metrics
-        time.sleep(60)
-        
-    finally:
-        system_manager.cleanup()

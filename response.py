@@ -27,20 +27,20 @@ class Response:
 
 class ResponseGenerator:
     def __init__(self, openai_api_key: str, cache_file: str = "response_cache.json", voice_id: str = "nova"):
-     self.api_key = openai_api_key
-     self.cache_file = cache_file
-     self.response_cache = self._load_cache()
-     self.audio_queue = Queue()
-     self.is_speaking = False
+        self.api_key = openai_api_key
+        self.cache_file = cache_file
+        self.response_cache = self._load_cache()
+        self.audio_queue = Queue()
+        self.is_speaking = False
 
-     # Initialize processors
-     self.local_processor = LocalProcessor()
-     self.cloud_processor = CloudProcessor(api_key=openai_api_key)
-     self.response_merger = ResponseMerger()
-     self.tts_engine = TTSEngine(api_key=openai_api_key, voice_id=voice_id)
+        # Initialize processors
+        self.local_processor = LocalProcessor()
+        self.cloud_processor = CloudProcessor(api_key=openai_api_key)
+        self.response_merger = ResponseMerger()
+        self.tts_engine = TTSEngine(api_key=openai_api_key, voice_id=voice_id)
 
-     # Start audio playback thread
-     self._start_audio_playback_thread()
+        # Start audio playback thread
+        self._start_audio_playback_thread()
 
     def _generate_cache_key(self, query: Query) -> str:
         """Generate a unique cache key for the query"""
@@ -111,31 +111,40 @@ class ResponseGenerator:
             logging.error(f"Error saving cache: {e}")
 
     async def generate_response(self, query: Query) -> Response:
-      """Generate response for the given query"""
-      try:
-         # Try local processing first
-         local_response = await self.local_processor.process(query)
-         if local_response:
-            response = local_response
-         else:
-             # Use cloud processing
-             response = await self.cloud_processor.process(query)
+        """Generate response for the given query"""
+        try:
+            response = None
+            cache_key = self._generate_cache_key(query)
 
-         # Generate speech if response was successful
-         if response and response.text:
-             audio_data = await self.tts_engine.generate_speech(response.text)
-             response.audio = audio_data
-             if audio_data:
-                self.audio_queue.put(audio_data)
+            # First try cache
+            if not query.text.lower().startswith(('what', 'how', 'when')):  # Skip cache for time-sensitive queries
+                response = self._check_cache(cache_key)
+                if response:
+                    return response
 
-         return response
+            # Try local processing
+            if not response:
+                response = await self.local_processor.process(query)
 
-      except Exception as e:
-        print(f"Error generating response: {str(e)}")
-        return Response(
-            text="I'm having trouble understanding. Could you please try again?",
-            source="error"
-        )
+            # Try cloud processing
+            if not response:
+                response = await self.cloud_processor.process(query)
+
+            # If response was successful and not a web search request
+            if response and response.text and not response.source.startswith('web_required:'):
+                # Cache non-web-search responses
+                if self._should_cache(query, response):
+                    self._cache_response(cache_key, response)
+
+            return response
+
+        except Exception as e:
+            print(f"Error generating response: {str(e)}")
+            return Response(
+                text="I'm having trouble understanding. Could you please try again?",
+                source="error"
+            )
+
     def _is_simple_query(self, query: Query) -> bool:
         """Determine if query can be handled locally"""
         simple_intents = {'time', 'weather', 'reminder', 'alarm', 'volume'}
@@ -145,6 +154,17 @@ class ResponseGenerator:
             query.text.lower() in self.local_processor.command_templates
         )
 
+    def cleanup(self):
+        """Clean up resources"""
+        try:
+            # Signal audio playback thread to stop
+            self.audio_queue.put(None)
+            # Save cache
+            self._save_cache(self.response_cache)
+        except Exception as e:
+            logging.error(f"Error in cleanup: {e}")
+
+            
     def _start_audio_playback_thread(self):
       """Start thread for audio playback"""
       def playback_worker():
@@ -170,8 +190,8 @@ class ResponseGenerator:
         self.cache_file = cache_file
         self.response_cache = self._load_cache()
         self.audio_queue = Queue()
-        self.is_speaking = False  # Add this flag
-        # ... rest of init ...
+        self.is_speaking = False  
+        
 
     def _play_audio(self, audio_data: bytes):
         """Play audio data"""
@@ -192,7 +212,7 @@ class ResponseGenerator:
             self.audio_queue.task_done()
             
         finally:
-            self.is_speaking = False  # Clear flag when done speaking
+            self.is_speaking = False  
             try:
                 if os.path.exists(temp_file):
                     os.remove(temp_file)
@@ -218,12 +238,12 @@ class LocalProcessor:
                 source="local"
             )
         else:
-            # Get template response
+            
             template = self.command_templates.get(query.text.lower())
             if template:
                 return Response(text=template, source="local")
             
-            # If no template found, let cloud processor handle it
+            
             return None
 
     def _load_command_templates(self) -> Dict[str, str]:
@@ -254,40 +274,76 @@ class CloudProcessor:
         self.client = openai.OpenAI(api_key=api_key)
 
     async def process(self, query: Query) -> Response:
-        """Process queries using OpenAI's GPT"""
-        try:
-            # Get conversation history for this speaker
-            history = self.conversation_history.get(query.speaker_id, [])
-            messages = self._prepare_messages(query, history)
-            
-            # In v1.0+, we don't use await with create()
-            completion = self.client.chat.completions.create(
-                model="gpt-4",
-                messages=messages,
-                temperature=0.7,
-                max_tokens=150
-            )
-            
-            response_text = completion.choices[0].message.content
-            
-            # Update conversation history
-            history.extend([
-                {"role": "user", "content": query.text},
-                {"role": "assistant", "content": response_text}
-            ])
-            # Keep last 10 exchanges
-            self.conversation_history[query.speaker_id] = history[-20:]
-            
-            # Create and return response object
+      """Process queries using OpenAI's GPT"""
+      try:
+        # First, determine if this query needs web search
+        system_prompt = """You are a helpful home assistant with web access capabilities. For queries needing real-time data, respond with the exact format:
+        [[SEARCH:type=<search_type>]]
+        where <search_type> should be one of: news, scores, weather, price, general
+        
+        Examples:
+        - For news queries: [[SEARCH:type=news]]
+        - For sports scores: [[SEARCH:type=scores]]
+        - For weather info: [[SEARCH:type=weather]]
+        - For prices: [[SEARCH:type=price]]
+        - For other real-time info: [[SEARCH:type=general]]
+        
+        Important: Respond ONLY with the search directive for queries needing real-time data.
+        For other queries, respond normally with a helpful answer."""
+        
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": query.text}
+        ]
+        
+        # Ask GPT if this needs web search
+        completion = self.client.chat.completions.create(
+            model="gpt-4",
+            messages=messages,
+            temperature=0.7,
+            max_tokens=150
+        )
+        
+        response_text = completion.choices[0].message.content
+        
+        # Check for search directive
+        if "[[SEARCH:" in response_text:
+            # Extract search type
+            search_type = response_text.split("type=")[1].split("]]")[0]
+            # Return special response with search type
             return Response(
-                text=response_text,
-                source="cloud",
-                cache_key=None  # Will be set by ResponseGenerator if needed
+                text="",  # Empty text since we'll get it from web search
+                source=f"web_required:{search_type}"
             )
-            
-        except Exception as e:
-            print(f"Error in cloud processing: {e}")
-            raise  # Let ResponseGenerator handle the error
+        
+        # Otherwise, proceed with normal conversation
+        history = self.conversation_history.get(query.speaker_id, [])
+        messages = self._prepare_messages(query, history)
+        
+        completion = self.client.chat.completions.create(
+            model="gpt-4",
+            messages=messages,
+            temperature=0.7,
+            max_tokens=150
+        )
+        
+        response_text = completion.choices[0].message.content
+        
+        # Update conversation history
+        history.extend([
+            {"role": "user", "content": query.text},
+            {"role": "assistant", "content": response_text}
+        ])
+        self.conversation_history[query.speaker_id] = history[-20:]
+        
+        return Response(
+            text=response_text,
+            source="cloud"
+        )
+        
+      except Exception as e:
+        logging.error(f"Error in cloud processing: {e}")
+        raise
 
     def _prepare_messages(self, query: Query, history: List) -> List[Dict]:
         """Prepare messages for GPT"""
@@ -300,7 +356,7 @@ class CloudProcessor:
             )}
         ]
         
-        # Add context if available
+        
         if query.context:
             messages.append({
                 "role": "system",

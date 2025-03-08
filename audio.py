@@ -3,11 +3,9 @@ import numpy as np
 import wave
 from collections import deque
 import webrtcvad
-import threading
 from queue import Queue
 from typing import Optional
 import queue
-import time
 
 class AudioInputSystem:
     def __init__(self):
@@ -173,25 +171,10 @@ class AudioBufferManager:
         """Save current buffer contents to WAV file"""
         with wave.open(filename, 'wb') as wf:
             wf.setnchannels(1)
-            wf.setsampwidth(2)  # 16-bit
+            wf.setsampwidth(2)   
             wf.setframerate(self.sample_rate)
             audio_data = (np.array(list(self.buffer)) * 32767).astype(np.int16)
             wf.writeframes(audio_data.tobytes())
 
 
-# Example usage
-if __name__ == "__main__":
-    audio_system = AudioInputSystem()
-    
-    try:
-        audio_system.start_audio_stream()
-        print("Listening for audio... Press Ctrl+C to stop")
-        
-        # Keep the main thread alive
-        while True:
-            pass
-            
-    except KeyboardInterrupt:
-        print("\nStopping audio system...")
-        audio_system.stop()
         

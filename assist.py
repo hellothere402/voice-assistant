@@ -1,3 +1,5 @@
+from bs4 import BeautifulSoup
+from urllib.parse import urlparse
 import asyncio
 import logging
 from typing import Optional
@@ -9,18 +11,20 @@ import time
 from response import Query
 import numpy as np
 import os
-import pygame
+from web_utilis import WebAccessManager
+
 
 from sym import SystemManager
 from voice import VoiceProcessingSystem
 from audio import AudioInputSystem
-from response import ResponseGenerator
+from response import ResponseGenerator, Response
 
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
 
 @dataclass
 class SystemConfig:
     openai_api_key: str
+    searchapi_key: str
     sample_rate: int = 16000
     device_name: str = "VoiceAssistant"
     debug_mode: bool = False
@@ -30,8 +34,7 @@ class SystemConfig:
 
 class IntegratedVoiceAssistant:
     def __init__(self, config_path: str = "config.yaml"):
-     print("Initializing IntegratedVoiceAssistant...")
-     try:
+        print("Initializing IntegratedVoiceAssistant...")
         # Load configuration
         self.config = self._load_config(config_path)
         print("Config loaded successfully")
@@ -50,16 +53,52 @@ class IntegratedVoiceAssistant:
         self.is_running = False
         self.start_time = time.time()
         print("Initialization complete")
-     except Exception as e:
-        print(f"Error during initialization: {e}")
-        raise
+
+    @classmethod
+    async def create(cls, config_path: str = "config.yaml"):
+        """Factory method to create and initialize the assistant"""
+        instance = cls(config_path)
+        await instance.speak_system_message("Initialization complete. Systems are ready.")
+        return instance
+
+    async def setup_voice_profile(self, name: str) -> bool:
+      """Create initial voice profile"""
+      try:
+        await self.speak_system_message("Preparing to create voice profile.")
+        await self.speak_system_message("Please prepare to speak for 5 seconds to create your voice profile.")
+        await self.speak_system_message("Recording will start in 3 seconds.")
+        await asyncio.sleep(3)  
+        
+        await self.speak_system_message("Recording now. Please speak normally.")
+        audio_data = await self._record_audio_sample(5)
+        
+        if audio_data is not None:
+            await self.speak_system_message("Recording complete. Processing voice profile.")
+            profile = self.voice_processor.create_voice_profile(audio_data, name)
+            
+            if profile:
+                success = await self.add_voice_profile(audio_data, name)
+                if success:
+                    await self.speak_system_message(f"Voice profile created successfully for {name}")
+                    return True
+                else:
+                    await self.speak_system_message("Failed to save voice profile")
+            else:
+                await self.speak_system_message("Failed to create voice profile")
+        else:
+            await self.speak_system_message("No audio data recorded")
+            
+        return False
+      except Exception as e:
+        await self.speak_system_message(f"Error in setup voice profile: {str(e)}")
+        return False
 
     def _load_config(self, config_path: str) -> SystemConfig:
       """Load system configuration"""
       print(f"Loading config from {config_path}")
       try:
          print("Checking if config file exists...")
-         if not os.path.exists(config_path):  # Fixed typo here, was 'exits'
+         if not os.path.exists(config_path):  
             print(f"Config file {config_path} does not exist")
             raise FileNotFoundError(f"Config file {config_path} not found")
         
@@ -69,7 +108,7 @@ class IntegratedVoiceAssistant:
             config_data = yaml.safe_load(f)
             print(f"Loaded raw config data: {config_data}")
             
-         # Extract voice_id from voice_settings if present
+         
          if 'voice_settings' in config_data:
             config_data['voice_id'] = config_data['voice_settings'].get('voice_id', 'nova')
             del config_data['voice_settings']
@@ -95,7 +134,7 @@ class IntegratedVoiceAssistant:
             print("No OpenAI API key found in environment variables")
             raise ValueError("OpenAI API key not found in environment variables")
             
-        # Save default config
+        
         print("Saving default config...")
         os.makedirs(os.path.dirname(os.path.abspath(config_path)), exist_ok=True)
         with open(config_path, 'w') as f:
@@ -114,31 +153,54 @@ class IntegratedVoiceAssistant:
         return SystemConfig(openai_api_key=api_key)
 
     def _init_components(self):
-     """Initialize all system components"""
-     try:
-         # Initialize system manager first
-         self.system_manager = SystemManager(self.config.db_path)
+      """Initialize all system components"""
+      try:
+        # Initialize system manager first
+        self.system_manager = SystemManager(self.config.db_path)
         
-         # Initialize audio input system
-         self.audio_system = AudioInputSystem()
+        # Initialize audio input system
+        self.audio_system = AudioInputSystem()
         
-         # Initialize voice processing
-         self.voice_processor = VoiceProcessingSystem(
+        # Initialize voice processing
+        self.voice_processor = VoiceProcessingSystem(
             self.config.openai_api_key
-         )
+        )
         
-         # Initialize response generator with voice_id
-         self.response_generator = ResponseGenerator(
+        # Initialize response generator with voice_id
+        self.response_generator = ResponseGenerator(
             self.config.openai_api_key,
             cache_file="response_cache.json",
             voice_id=self.config.voice_id  # Pass the voice_id from config
-         )
+        )
+
+        # Initialize web access manager with API key
+        self.web_manager = WebAccessManager()
+        self.web_manager.session.params = {"api_key": self.config.searchapi_key}
         
-         logging.info("All components initialized successfully")
+        logging.info("All components initialized successfully")
         
-     except Exception as e:
+      except Exception as e:
         logging.error(f"Error initializing components: {e}")
         raise
+     
+
+    async def speak_system_message(self, message: str, wait: bool = True):
+      """Speak a system message using TTS"""
+      try:
+         print(message)  # Still print the message for logging
+        
+         # Generate and queue the audio
+         audio_data = await self.response_generator.tts_engine.generate_speech(message)
+         if audio_data:
+            self.response_generator.audio_queue.put(audio_data)
+            
+            # If wait is True, wait for the audio to finish
+            if wait:
+                while self.response_generator.is_speaking or \
+                      self.response_generator.audio_queue.qsize() > 0:
+                    await asyncio.sleep(0.1)
+      except Exception as e:
+        print(f"Error in speak_system_message: {e}")
 
     async def setup_voice_profile(self, name: str) -> bool:
         """Create initial voice profile"""
@@ -146,7 +208,7 @@ class IntegratedVoiceAssistant:
             print("\nPreparing to create voice profile...")
             print("Please speak for 5 seconds to create your voice profile...")
             print("Recording will start in 3 seconds...")
-            await asyncio.sleep(3)  # Give user time to prepare
+            await asyncio.sleep(3)  
             
             print("\n🎤 Recording NOW - Please speak normally...")
             audio_data = await self._record_audio_sample(5)
@@ -181,7 +243,7 @@ class IntegratedVoiceAssistant:
         "4": ("echo", "Male, deep and clear"),
         "5": ("fable", "Male, British accent"),
         "6": ("onyx", "Male, deep and authoritative")
-      }  # Just close the dictionary with }
+      } 
     
 
      print("\n🗣️ Please select a voice for your assistant:")
@@ -242,7 +304,6 @@ class IntegratedVoiceAssistant:
             await asyncio.sleep(0.1)
         
         if len(collected_samples) >= required_samples:
-            # Trim to exact length
             audio_data = np.array(collected_samples[:required_samples], dtype=np.float32)
             audio_data = audio_data.reshape(1, -1)
             print(f"Recorded audio shape: {audio_data.shape}")
@@ -289,26 +350,22 @@ class IntegratedVoiceAssistant:
         self.stop()
 
     async def _process_cycle(self):
-     """Main processing cycle"""
-     try:
-        # Only process new input if we're not already handling a query
+      """Main processing cycle"""
+      try:
         if (hasattr(self, 'is_processing') and self.is_processing) or \
-           self.response_generator.is_speaking:  # Check if assistant is speaking
+            self.response_generator.is_speaking:
             await asyncio.sleep(0.1)
             return
 
-        # Get audio from buffer
         audio_data = self.audio_system.get_audio_buffer()
         
         if len(audio_data) > 0 and len(audio_data) >= self.config.sample_rate * 2:
-            # Set processing flag
             self.is_processing = True
-            self.audio_system.pause()  # Pause audio input
+            self.audio_system.pause()  
             
             try:
                 print("\nProcessing audio input...")
                 
-                # Process voice and generate response
                 audio_data = audio_data.reshape(1, -1)
                 voice_result = self.voice_processor.process_voice(
                     audio_data,
@@ -317,32 +374,40 @@ class IntegratedVoiceAssistant:
                 
                 if voice_result and voice_result.text:
                     print(f"\n👤 You said: {voice_result.text}")
-                    
+
                     query_obj = Query(
                         text=voice_result.text,
                         intent=voice_result.intent,
                         speaker_id=voice_result.speaker_id
                     )
-                    
-                    print("💭 Generating response...")
+
+                    # Handle all responses in a single path
                     response = await self.response_generator.generate_response(query_obj)
-                    
+                    if response and response.source and response.source.startswith("web_required:"):
+                        search_type = response.source.split(":")[1]
+                        await self.speak_system_message("Let me search for that information...")
+                        search_response = await self.web_manager.process_web_query(
+                            query_obj.text, 
+                            search_type
+                        )
+                        response = Response(text=search_response)
+
                     if response and response.text:
                         print(f"🤖 Assistant: {response.text}\n")
                         
-                        # Wait for TTS audio to complete
-                        if response.audio:
-                            # Wait for the playback to fully complete
-                            while self.response_generator.is_speaking or \
-                                  self.response_generator.audio_queue.qsize() > 0:
-                                await asyncio.sleep(0.1)
-                            
-                            # Additional wait to ensure everything is done
-                            await asyncio.sleep(0.2)
-                            
-                            # Now clear the buffer and resume listening
-                            self.audio_system.audio_buffer.clear()
-                            print("\n👂 Listening for your voice...")
+                        # Generate and play TTS only once
+                        if hasattr(self.response_generator, 'tts_engine'):
+                            audio_data = await self.response_generator.tts_engine.generate_speech(response.text)
+                            if audio_data:
+                                self.response_generator.audio_queue.put(audio_data)
+                                # Wait for audio to complete
+                                while self.response_generator.is_speaking or \
+                                    self.response_generator.audio_queue.qsize() > 0:
+                                    await asyncio.sleep(0.1)
+                                await asyncio.sleep(0.2)
+                
+                self.audio_system.audio_buffer.clear()
+                print("\n👂 Listening for your voice...")
                 
             finally:
                 self.is_processing = False
@@ -350,7 +415,7 @@ class IntegratedVoiceAssistant:
                 
         await asyncio.sleep(0.1)
 
-     except Exception as e:
+      except Exception as e:
         print(f"❌ Error in processing cycle: {e}")
         print(f"Error details: {str(e)}")
         self.system_manager.performance_monitor.log_error()
@@ -361,7 +426,6 @@ class IntegratedVoiceAssistant:
       """Wait for TTS audio playback to complete"""
       while self.response_generator.audio_queue.qsize() > 0:
         await asyncio.sleep(0.1)
-      # Additional small delay after audio completes
       await asyncio.sleep(0.2)
 
     def stop(self):
@@ -369,7 +433,6 @@ class IntegratedVoiceAssistant:
         logging.info("Stopping voice assistant...")
         self.is_running = False
         
-        # Cleanup components
         try:
             self.audio_system.stop()
             self.response_generator.cleanup()
@@ -379,6 +442,33 @@ class IntegratedVoiceAssistant:
             
         except Exception as e:
             logging.error(f"Error during shutdown: {e}")
+
+    async def process_web_query(self, query: str) -> str:
+      """Process queries that require web access"""
+      try:
+         # Extract the actual search query (remove words like "search for" or "look up")
+         search_terms = query.lower()
+         search_terms = search_terms.replace("search for", "")
+         search_terms = search_terms.replace("look up", "")
+         search_terms = search_terms.strip()
+
+         # Perform the search
+         results = await self.web_manager.search_web(search_terms)
+        
+         if results and results['results']:
+            # Format the response
+            response_text = f"Here's what I found about {search_terms}:\n\n"
+            
+            for idx, result in enumerate(results['results'], 1):
+                response_text += f"{result['title']}\n"
+                response_text += f"{result['snippet']}\n\n"
+                
+            return response_text
+         else:
+            return f"I'm sorry, I couldn't find any relevant information about {search_terms}."
+
+      except Exception as e:
+        return f"I encountered an error while searching: {str(e)}"
 
     async def add_voice_profile(self, audio_data: np.ndarray, name: str) -> bool:
         """Add a new voice profile"""
@@ -407,20 +497,16 @@ if __name__ == "__main__":
     print("Starting program...")
     async def main():
         print("Entered Main Function")
+        assistant = None
         try:
             print("\n🚀 Initializing Voice Assistant...")
-            print("Creating IntegratedVoiceAssistant...")
-            assistant = IntegratedVoiceAssistant()
-            print("Assistant created successfully")
+            assistant = await IntegratedVoiceAssistant.create() 
             
-            # Voice selection on first run
-            print("Checking for voice settings...")
             try:
                 with open("config.yaml", 'r') as f:
                     config = yaml.safe_load(f)
-                    print("Config loaded:", config)
                 if 'voice_id' not in config:
-                    print("\n🗣️ Initial setup - Voice selection")
+                    await assistant.speak_system_message("Initial setup - Voice selection required.")
                     voice_id = await assistant.select_voice()
                     assistant.config.voice_id = voice_id
                     assistant.response_generator = ResponseGenerator(
@@ -429,7 +515,7 @@ if __name__ == "__main__":
                         voice_id=voice_id
                     )
             except FileNotFoundError:
-                print("Config file not found, starting voice selection...")
+                await assistant.speak_system_message("Config file not found. Starting voice selection.")
                 voice_id = await assistant.select_voice()
                 assistant.config.voice_id = voice_id
                 assistant.response_generator = ResponseGenerator(
@@ -438,30 +524,27 @@ if __name__ == "__main__":
                     voice_id=voice_id
                 )
             
-            print("Setting up voice profile...")
+            await assistant.speak_system_message("Setting up voice profile.")
             profile_created = await assistant.setup_voice_profile("User1")
             
             if profile_created or os.path.exists("voice_profiles.json"):
-                print("\n🎯 Starting voice assistant... Press Ctrl+C to stop")
-                print("👂 Listening for your voice...")
+                await assistant.speak_system_message("Voice assistant is now active and listening. Speak clearly and I'll respond to you.")
                 await assistant.start()
             else:
-                print("\n❌ Could not create voice profile. System will now exit.")
+                await assistant.speak_system_message("Could not create voice profile. System will now exit.")
                 return
 
         except KeyboardInterrupt:
-            print("\n\n👋 Shutting down by user request...")
+            if assistant:
+                await assistant.speak_system_message("Shutting down by user request.")
         except Exception as e:
-            print(f"\n❌ Error occurred: {e}")
-            print(f"Exception type: {type(e)}")
-            print(f"Full exception details: {str(e)}")
+            if assistant:
+                await assistant.speak_system_message(f"Error occurred: {str(e)}")
             raise
         finally:
-            if 'assistant' in locals():
-                print("Stopping assistant...")
+            if assistant:
+                await assistant.speak_system_message("Stopping assistant.")
                 assistant.stop()
-            print("\n✨ System shutdown complete")
+                await assistant.speak_system_message("System shutdown complete.")
 
-    # Run the async main function
-    import asyncio
     asyncio.run(main())
